@@ -1,0 +1,12 @@
+{
+  "title": "标题",
+  "weread": {
+    "cookie": "微信读书Cookie",
+    "saveCookie": "保存Cookie",
+    "bookshelf": "我的书架",
+    "settings": "设置",
+    "sync": "同步",
+    "resync": "重新同步",
+    "noBooks": "暂无书籍"
+  }
+}

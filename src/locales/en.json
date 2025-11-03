@@ -1,0 +1,12 @@
+{
+  "title": "title",
+  "weread": {
+    "cookie": "WeRead Cookie",
+    "saveCookie": "Save Cookie",
+    "bookshelf": "My Bookshelf",
+    "settings": "Settings",
+    "sync": "Sync",
+    "resync": "Resync",
+    "noBooks": "No books yet"
+  }
+}
