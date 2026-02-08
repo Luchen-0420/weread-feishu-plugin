@@ -3,10 +3,6 @@
 > 既然选择了阅读，那就让数据说话。
 > 将你的微信读书数据自动同步至飞书多维表格，支持阅读进度管理、书单整理及画册展示。
 
-<img width="511" height="174" alt="image" src="https://github.com/user-attachments/assets/07c970da-4cdc-4cf7-8d40-c246e9ee94cd" />
-<img width="689" height="82" alt="image" src="https://github.com/user-attachments/assets/51f9af51-dffd-44d4-9122-9c045a48b9d6" />
-<img width="712" height="77" alt="image" src="https://github.com/user-attachments/assets/99b1d2d9-8cd2-46a9-8d7c-79a946fbac01" />
-
 
 
 ![](https://fastly.jsdelivr.net/gh/bucketio/img19@main/2025/10/30/1761819932009-8da4a36e-d809-4270-8aad-27a215c64221.png)
