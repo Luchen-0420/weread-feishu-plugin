@@ -111,7 +111,11 @@ class WeReadAPI {
       }
 
       if (!data.books || !Array.isArray(data.books)) {
-        throw new Error('返回数据缺少 books 字段或格式错误')
+        if (data.errCode === -2012) {
+          throw new Error('微信读书登录状态已过期 (errCode: -2012)，请重新获取并设置 Cookie');
+        }
+        console.error('获取书架异常，API返回完整数据:', data);
+        throw new Error(`返回数据缺少 books 字段或格式错误: ${JSON.stringify(data)}`);
       }
 
       if (!data.bookProgress || !Array.isArray(data.bookProgress)) {
@@ -354,6 +358,172 @@ class WeReadAPI {
       console.error(errorMsg)
       throw new Error(errorMsg)
     }
+  }
+
+  // 获取特殊请求头（绕过反爬虫策略）
+  getHighlightHeaders(cookieString, bookId) {
+    return {
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'X-Weread-Cookie': cookieString,
+      'Referer': `https://weread.qq.com/web/reader/${bookId}`,
+      'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin',
+    };
+  }
+
+  // 获取书籍划线
+  async getBookHighlights(bookId) {
+    try {
+      const cookieString = this.getCookies()
+      if (!cookieString) throw new Error('Cookie未设置');
+      
+      const url = `${this.baseURL}/book/bookmarklist?bookId=${bookId}&synckey=0&_t=${Date.now()}`;
+      const response = await this.fetchWithTimeout(url, {
+        method: 'GET',
+        headers: this.getHighlightHeaders(cookieString, bookId)
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`获取书籍划线失败 (bookId: ${bookId}):`, error);
+      return null;
+    }
+  }
+
+  // 获取书籍想法
+  async getBookThoughts(bookId) {
+    try {
+      const cookieString = this.getCookies()
+      if (!cookieString) throw new Error('Cookie未设置');
+      
+      const url = `${this.baseURL}/review/list?bookId=${bookId}&listType=11&mine=1&synckey=0&_t=${Date.now()}`;
+      const response = await this.fetchWithTimeout(url, {
+        method: 'GET',
+        headers: this.getHighlightHeaders(cookieString, bookId)
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`获取书籍想法失败 (bookId: ${bookId}):`, error);
+      return null;
+    }
+  }
+
+  // 格式化时间戳
+  formatTimestamp(timestamp) {
+    if (!timestamp) return "";
+    const ts = typeof timestamp === 'number' ? timestamp : parseInt(timestamp, 10);
+    if (isNaN(ts)) return "";
+    const date = ts > 9999999999 ? new Date(ts) : new Date(ts * 1000);
+    return date.toLocaleString();
+  }
+
+  // 生成 Markdown 并转为 File 对象
+  async exportNotesToMarkdownFile(bookId, bookInfo) {
+    const highlightsData = await this.getBookHighlights(bookId);
+    const thoughtsData = await this.getBookThoughts(bookId);
+    
+    let markdown = `# 《${bookInfo.title}》 读书笔记\n\n`;
+    
+    // 添加书籍元信息
+    markdown += `> **作者**：${bookInfo.author || '未知'} | **导出时间**：${new Date().toLocaleString()} | **阅读进度**：${bookInfo.progress || 0}%\n\n`;
+    if (bookInfo.cover) {
+      markdown += `![书籍封面](${bookInfo.cover})\n\n`;
+    }
+    markdown += `---\n\n`;
+
+    // 整理章节映射
+    const chapterMap = new Map();
+    if (highlightsData && highlightsData.chapters) {
+      highlightsData.chapters.forEach(ch => chapterMap.set(ch.chapterUid, ch.title));
+    }
+    
+    // 整理所有笔记数据
+    const allNotes = [];
+    
+    // 1. 处理划线
+    if (highlightsData && highlightsData.updated) {
+      highlightsData.updated.forEach(highlight => {
+        allNotes.push({
+          type: 'highlight',
+          chapterUid: highlight.chapterUid,
+          chapterTitle: chapterMap.get(highlight.chapterUid) || `章节 ${highlight.chapterUid}`,
+          text: highlight.markText,
+          timeStr: this.formatTimestamp(highlight.created),
+          timestamp: highlight.createTime || highlight.created
+        });
+      });
+    }
+
+    // 2. 处理想法
+    if (thoughtsData && thoughtsData.reviews) {
+      thoughtsData.reviews.forEach(thought => {
+        const review = typeof thought.review === 'string' ? JSON.parse(thought.review) : thought.review;
+        if (!review) return;
+        const createTime = review.createTime || thought.createTime || 0;
+        allNotes.push({
+          type: 'thought',
+          chapterUid: review.chapterUid || thought.chapterUid || 0,
+          chapterTitle: review.chapterName || review.chapterTitle || thought.chapterTitle || "未知章节",
+          text: review.abstract || "", // 原文
+          content: review.content || "", // 想法
+          timeStr: this.formatTimestamp(createTime),
+          timestamp: createTime
+        });
+      });
+    }
+
+    if (allNotes.length === 0) {
+      return null; // 无笔记
+    }
+
+    // 按章节分组
+    const groupedNotes = {};
+    allNotes.forEach(note => {
+      if (!groupedNotes[note.chapterUid]) {
+        groupedNotes[note.chapterUid] = {
+          title: note.chapterTitle,
+          notes: []
+        };
+      }
+      groupedNotes[note.chapterUid].notes.push(note);
+    });
+
+    // 排序并在 Markdown 中生成
+    const chapterUids = Object.keys(groupedNotes).sort((a, b) => parseInt(a) - parseInt(b));
+    chapterUids.forEach(uid => {
+      const chapter = groupedNotes[uid];
+      markdown += `## ${chapter.title}\n\n`;
+      
+      // 按时间戳对同一章的笔记排序
+      chapter.notes.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      
+      chapter.notes.forEach(note => {
+        if (note.type === 'highlight') {
+          markdown += `> ${note.text}\n\n`;
+          if (note.timeStr) {
+            markdown += `*🕒 ${note.timeStr}*\n\n`;
+          }
+        } else if (note.type === 'thought') {
+          if (note.text) {
+             markdown += `> ${note.text}\n\n`;
+          }
+          markdown += `**💡 我的想法：** ${note.content}\n\n`;
+          if (note.timeStr) {
+            markdown += `*🕒 ${note.timeStr}*\n\n`;
+          }
+        }
+      });
+    });
+
+    // 生成 Blob
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
+    const fileName = `${bookInfo.title || '无书名'}_读书笔记.md`
+    return new File([blob], fileName, { 
+      type: 'text/markdown',
+      lastModified: Date.now()
+    })
   }
 }
 

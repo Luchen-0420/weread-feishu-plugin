@@ -60,6 +60,17 @@
           </el-button>
           
           <el-button 
+            class="action-btn action-equal"
+            type="success"
+            plain
+            @click="exportWebpageData" 
+            :loading="loading"
+          >
+            <template #icon><el-icon><Download /></el-icon></template>
+            导出网页数据
+          </el-button>
+          
+          <el-button 
             class="action-btn action-narrow"
             :type="hasCookie ? 'default' : 'primary'"
             @click="showSettingsDialog"
@@ -101,6 +112,18 @@
                 >
                   <template #icon><el-icon><Refresh /></el-icon></template>
                   更新进度
+                </el-button>
+                <el-button 
+                  type="success" 
+                  size="small" 
+                  link
+                  class="update-btn"
+                  @click="exportNotes(book)"
+                  :loading="book.exportingNotes"
+                  style="color: #9c27b0;"
+                >
+                  <template #icon><el-icon><Download /></el-icon></template>
+                  导出笔记
                 </el-button>
               </div>
             </div>
@@ -244,6 +267,22 @@
         </el-tab-pane>
       </el-tabs>
       
+      <el-divider>多维表格配置</el-divider>
+      <el-form label-position="top" class="settings-form">
+        <el-form-item label="多维表格授权码 PersonalBaseToken (选填，导出笔记需要)">
+          <el-input
+            v-model="personalBaseToken"
+            type="password"
+            placeholder="请输入个人多维表格授权码"
+            clearable
+            show-password
+          />
+          <div class="form-tips">
+            可在当前多维表格“⚙ 设置 -> 高级设置 -> 开放平台 -> 个人多维表格授权码”获取。填写后可导出笔记为附件。
+          </div>
+        </el-form-item>
+      </el-form>
+      
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="showSettings = false" v-if="hasCookie">取消</el-button>
@@ -278,6 +317,9 @@ const loading = ref(false)
 const syncProgress = ref('')
 const books = ref([])
 const cookieInput = ref('')
+const personalBaseToken = ref(localStorage.getItem('weread_feishu_base_token') || '')
+
+watch(personalBaseToken, (val) => localStorage.setItem('weread_feishu_base_token', val || ''))
 const hasCookie = ref(false)
 const showSettings = ref(false)
 
@@ -906,7 +948,7 @@ const updateBookshelfWithDetection = async () => {
         ElMessage.info('首次同步检测到大量书籍，将逐本写入表格，请耐心等待...')
         
         // 直接调用 writeToTable 函数，它会逐本获取详情并立即写入
-        books.value = bookList.map(b => ({ ...b, updating: false }))
+        books.value = bookList.map(b => ({ ...b, updating: false, exportingNotes: false }))
         
         try {
           await writeToTable()
@@ -971,7 +1013,7 @@ const updateBookshelfWithDetection = async () => {
         books.value.map(b => String(b.bookId))
       )
       const toAppend = newBooks.value
-        .map(b => ({ ...b, updating: false }))
+        .map(b => ({ ...b, updating: false, exportingNotes: false }))
         .filter(b => {
           const key = String(b.bookId)
           return !existingIds.has(key)
@@ -1185,6 +1227,152 @@ const updateBookProgress = async (book) => {
   }
 }
 
+// 导出笔记为附件
+const exportNotes = async (book) => {
+  try {
+    book.exportingNotes = true
+    
+    // 1. 获取完整的笔记文件 Blob
+    const file = await wereadAPI.exportNotesToMarkdownFile(book.bookId, book)
+    if (!file) {
+      ElMessage.warning(`《${book.title}》没有新的划线或想法可以导出`)
+      book.exportingNotes = false
+      return
+    }
+
+    // 2. 将此文件上传到飞书，获取 Token
+    let fileToken = ''
+    try {
+      fileToken = await bitable.base.uploadFile(file)
+    } catch (e) {
+      console.error('上传文件失败:', e)
+      throw new Error(`无法上传附件到飞书: ${e.message}`)
+    }
+
+    // 3. 将 Token 写入到当前多维表格的这行记录里
+    const table = await bitable.base.getActiveTable()
+    if (!table) throw new Error('未能获取到当前表格')
+    
+    // 获取所需字段
+    const existingFields = await table.getFieldMetaList()
+    
+    // 检查字段是否存在
+    const notesField = existingFields.find(f => f.name === '笔记')
+    if (!notesField) {
+      throw new Error('未找到名为「笔记」的字段，请先新建一列并命名为「笔记」')
+    }
+    // 检查类型是否为 Attachment (type: 17)
+    if (notesField.type !== 17) {
+      throw new Error('名为「笔记」的字段类型必须是“附件”，请在飞书中更改它的列类型')
+    }
+    
+    const fieldsMap = {}
+    fieldsMap['bookid'] = await table.getField('bookid')
+    fieldsMap['笔记'] = await table.getField('笔记')
+
+    const records = await fetchAllRecords(table)
+    const bookidFieldId = fieldsMap['bookid'].id
+    const targetBookId = String(book.bookId).trim()
+    
+    let matchingRecords = records.filter(record => {
+      if (!record) return false
+      const raw = getRecordFieldValue(record, bookidFieldId)
+      const recordBookIdText = extractTextFromRichText(raw)?.trim()
+      return recordBookIdText === targetBookId
+    })
+    
+    // 回退：若通过 bookid 未匹配到，尝试用书名匹配
+    if ((!matchingRecords || matchingRecords.length === 0)) {
+      const titleField = existingFields.find(f => f.name === '书名')
+      if (titleField) {
+        fieldsMap['书名'] = await table.getField('书名')
+        const titleFieldId = fieldsMap['书名'].id
+        const targetTitle = String(book.title || '').trim()
+        matchingRecords = records.filter(record => {
+          const rawTitle = getRecordFieldValue(record, titleFieldId)
+          const recordTitle = extractTextFromRichText(rawTitle)?.trim()
+          return recordTitle && recordTitle === targetTitle
+        })
+      }
+    }
+    
+    if (matchingRecords && matchingRecords.length > 0) {
+      const recordId = matchingRecords[0].recordId
+      
+      if (!personalBaseToken.value) {
+        throw new Error('当前环境需要配置【多维表格授权码】才能直传附件，请在上方齿轮设置中填入。')
+      }
+
+      console.log('正在通过 PersonalBaseToken 直传文件...', file)
+      
+      let fileToken = ''
+      try {
+        const appToken = await bitable.base.getSelection().then(s => s.baseId)
+        const formData = new FormData()
+        formData.append('file_name', file.name)
+        formData.append('parent_type', 'bitable_file')
+        formData.append('parent_node', appToken)
+        formData.append('size', file.size)
+        formData.append('file', file)
+        
+        // PersonalBaseToken 使用独立域名 base-api.feishu.cn，不是 open.feishu.cn
+        const baseUrl = import.meta.env.DEV ? '/api/base' : 'https://base-api.feishu.cn'
+        const apiUrl = `${baseUrl}/open-apis/drive/v1/medias/upload_all`
+        
+        const uploadResponse = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${personalBaseToken.value.trim()}`
+          },
+          body: formData
+        })
+        
+        const result = await uploadResponse.json()
+        if (result.code !== 0) {
+          throw new Error(`飞书 API 报错: [${result.code}] ${result.msg}`)
+        }
+        
+        fileToken = result.data.file_token
+      } catch (e) {
+        throw new Error(`直传附件请求失败: ${e.message || JSON.stringify(e)}`)
+      }
+      
+      if (!fileToken) {
+        throw new Error('直传请求完成但未获取到 file_token，请检查授权码权限是否正确。')
+      }
+      
+      console.log('文件直传成功, 拿到官方 Token:', fileToken)
+      
+      const payload = [{
+        file_token: fileToken,
+        token: fileToken, // 满足 JS SDK 前端验证器对 IOpenAttachment 的硬性依赖
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        timeStamp: Date.now()
+      }]
+      
+      console.log('正在更新笔记附件记录:', recordId, ' payload:', JSON.stringify(payload))
+      
+      try {
+        await table.setCellValue(fieldsMap['笔记'].id, recordId, payload)
+      } catch(e) {
+        throw new Error(`Bitable单元格赋值失败(可能是 token 已失效或不被识别): ${e.message || JSON.stringify(e)}`)
+      }
+      
+      ElMessage.success(`《${book.title}》的笔记导出成功！(${fileToken.substring(0, 5)}...)`)
+    } else {
+      ElMessage.warning(`未找到《${book.title}》对应的表格记录，请先同步该书籍到表格`)
+    }
+    
+  } catch (error) {
+    ElMessage.error(`导出笔记失败: ${error.message} - ${JSON.stringify(error)}`)
+    console.error('详细错误内容:', error)
+  } finally {
+    book.exportingNotes = false
+  }
+}
+
 // 移除 formatProgress 函数，不对进度值做任何处理
 
 // 格式化阅读时长显示
@@ -1349,12 +1537,136 @@ const fetchBooks = async () => {
     // 确保每本书都有 updating 属性
     books.value = bookList.map(book => ({
       ...book,
-      updating: false
+      updating: false, exportingNotes: false
     }))
     
     ElMessage.success(`成功获取 ${bookList.length} 本书的信息`)
   } catch (error) {
     ElMessage.error('获取书架失败：' + error.message)
+  } finally {
+    loading.value = false
+    syncProgress.value = ''
+  }
+}
+
+// 一键导出网页数据（静态脱机版本）
+const exportWebpageData = async () => {
+  try {
+    loading.value = true
+    syncProgress.value = '正在提取多维表格数据与微信读书笔记，请耐心等待...'
+
+    const table = await bitable.base.getActiveTable()
+    if (!table) throw new Error('未能获取到当前表格')
+
+    const records = await fetchAllRecords(table)
+    const exportData = []
+    
+    // 尝试从本地加载笔记缓存，避免重复下载
+    let notesCache = {}
+    try {
+      const cacheStr = localStorage.getItem('weread_notes_export_cache')
+      if (cacheStr) notesCache = JSON.parse(cacheStr)
+    } catch (e) {
+      console.warn('读取本地缓存失败', e)
+    }
+    
+    const existingFields = await table.getFieldMetaList()
+    const targetFieldNames = ['书名', '作者', '简介', '一级分类', '二级分类', '阅读时长', '阅读进度', '是否读完', '封面链接', 'bookid', '笔记']
+    const fieldsMap = {}
+    for (const name of targetFieldNames) {
+      const ft = existingFields.find(f => f.name === name || f.name.toLowerCase() === name.toLowerCase())
+      if (ft) {
+        fieldsMap[name] = ft.id
+      }
+    }
+
+    let i = 0
+    let fetchedCount = 0
+    
+    for (const record of records) {
+      i++
+      const item = {}
+      for (const name of targetFieldNames) {
+        const fieldId = fieldsMap[name]
+        if (!fieldId) continue
+        const rawParam = getRecordFieldValue(record, fieldId)
+        
+        if (name === '是否读完') {
+          if (rawParam && rawParam.text) {
+             item[name] = rawParam.text
+          } else {
+             item[name] = extractTextFromRichText(rawParam)
+          }
+        } else if (name === '笔记') {
+          item[name] = ''
+          try {
+            if (Array.isArray(rawParam) && rawParam.length > 0 && (rawParam[0].token || rawParam[0].file_token)) {
+              const token = rawParam[0].token || rawParam[0].file_token;
+              
+              if (notesCache[token]) {
+                item[name] = notesCache[token];
+                syncProgress.value = `读取缓存的笔记《${item['书名']}》 (${i}/${records.length})`;
+              } else {
+                syncProgress.value = `正在从多维表格拉取笔记附件《${item['书名']}》 (${i}/${records.length})`;
+                // 微小延迟以防频繁调用API
+                await wereadAPI.sleep(100);
+                
+                let urls;
+                if (typeof table.getCellAttachmentUrls === 'function') {
+                  urls = await table.getCellAttachmentUrls([token], fieldId, record.recordId);
+                } else {
+                  const url = await table.getAttachmentUrl(token, fieldId, record.recordId);
+                  urls = url ? [url] : [];
+                }
+                
+                if (urls && urls.length > 0) {
+                  const mdRes = await fetch(urls[0]);
+                  if (mdRes.ok) {
+                    const text = await mdRes.text();
+                    item[name] = text;
+                    notesCache[token] = text;
+                    fetchedCount++;
+                  }
+                }
+              }
+            } else {
+               item[name] = extractTextFromRichText(rawParam);
+            }
+          } catch(e) {
+            console.warn('读取附件失败', e)
+            item[name] = extractTextFromRichText(rawParam);
+          }
+        } else {
+           item[name] = extractTextFromRichText(rawParam)
+        }
+      }
+      
+      exportData.push(item)
+    }
+
+    // 更新到本地缓存
+    try {
+      localStorage.setItem('weread_notes_export_cache', JSON.stringify(notesCache))
+    } catch (e) {
+      console.warn('保存缓存失败，可能是数据超出了 LocalStorage 限制，本次缓存跳过', e)
+    }
+
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(exportData, null, 2))
+    const downloadAnchorNode = document.createElement('a')
+    downloadAnchorNode.setAttribute("href", dataStr)
+    downloadAnchorNode.setAttribute("download", "weread_data.json")
+    document.body.appendChild(downloadAnchorNode)
+    downloadAnchorNode.click()
+    downloadAnchorNode.remove()
+    
+    if (fetchedCount > 0) {
+      ElMessage.success(`成功导出 ${exportData.length} 条记录！（其中更新了 ${fetchedCount} 本书的最新笔记）`)
+    } else {
+      ElMessage.success(`成功极速导出 ${exportData.length} 条记录的数据！（笔记内容全部来自本地智能缓存）`)
+    }
+  } catch (error) {
+    ElMessage.error(`导出网页数据失败: ${error.message}`)
+    console.error(error)
   } finally {
     loading.value = false
     syncProgress.value = ''
